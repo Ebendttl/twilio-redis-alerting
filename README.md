@@ -1,49 +1,57 @@
 # Architecting a Resilient Distributed Alerting Pipeline with Redis Sliding-Window Rate Limiting and Twilio SMS
 
-During a major outage—such as a primary database crash or network partition—systems degrade rapidly, emitting thousands of cascading error events per second. A naive alerting setup that listens to exception logs and pushes SMS notifications directly to Twilio will catastrophically fail. First, it will trigger Twilio’s API concurrency limits, queueing and delaying critical alerts. Second, it will incur massive API usage costs. Third, it will subject on-call engineers to "alert fatigue," blinding them to the root cause of the incident.
+It is 2:00 AM. A transient network partition has just severed your web server fleet from your primary PostgreSQL cluster. Within seconds, the database connection pool exhausts. The application servers begin spawning thousands of database timeout exceptions per second. In a naive alerting architecture, each exception triggers a direct, synchronous call to your SMS gateway. 
 
-To solve this, we must build a decoupled, distributed alerting pipeline. This tutorial demonstrates how to architect a production-ready alerting service in TypeScript. It uses a **Redis Queue** for low-latency asynchronous processing, a **Redis Sorted Set (ZSET)** managed by an **atomic Lua script** to implement distributed sliding-window rate limiting, and the **Twilio SMS API** to deliver alerts with automatic sandbox simulation fallback.
+The consequences are immediate and catastrophic:
+1. **API Rate Limiting:** The sheer volume of concurrent requests triggers Twilio API throttling, queueing notifications and delaying critical, unrelated status updates.
+2. **Financial Bleed:** A single unthrottled loop executing thousands of SMS dispatches can drain your company's Twilio credit balance in minutes.
+3. **On-Call Paralysis:** An engineer wakes up to a phone vibrating continuously with thousands of identical text messages. This is the definition of "alert fatigue"—it hides the root cause and slows down the time to resolution.
+
+To survive an incident storm, you need a decoupled alerting system that throttles warnings dynamically while ensuring no critical data is lost. This tutorial walks you through building a production-ready, distributed alerting pipeline in TypeScript. We will construct an asynchronous worker pool using a durable **Redis Queue**, implement a highly precise **Sliding-Window Log rate-limiter** via an **atomic Redis Lua script**, and connect it to the **Twilio SMS API** with built-in format validation and sandbox simulation fallbacks.
 
 ---
 
-## Architecture Overview
+## Architecture Flow
 
-A reliable distributed alerting system separates the *detection* of an anomaly from the *notification* mechanism. We utilize an asynchronous worker pool pattern to handle high-throughput event spikes without choking downstream SMS gateways.
+Below is the ASCII diagram of our alerting pipeline. By separating alert publishers (your microservices) from the actual SMS delivery worker pool, we isolate downstream gateways from high-volume spikes.
 
-```mermaid
-graph TD
-    subgraph "Producer Services"
-        P1[Auth Microservice] -- RPUSH alert --> Queue
-        P2[Database Monitor] -- RPUSH alert --> Queue
-    end
-
-    subgraph "In-Memory Broker (Redis)"
-        Queue[alerting:queue - Redis List]
-        ZSET[rate_limit:fingerprint - Redis Sorted Set]
-    end
-
-    subgraph "Alerting Daemon Pool"
-        Worker[Worker Daemon] -- BLPOP --> Queue
-        Worker -- atomic checkRateLimit --> ZSET
-    end
-
-    subgraph "Notification Gateways"
-        Twilio[Twilio SMS API]
-        Mock[Console Mock Logger]
-    end
-
-    Worker -- Allowed --> Twilio
-    Worker -- Suppressed --> Mock
+```text
++-----------------------+      +-------------------------+
+|   Auth Microservice   |      |  Database Monitor Job   |
++-----------+-----------+      +------------+------------+
+            |                               |
+            | (RPUSH alert JSON)            | (RPUSH alert JSON)
+            v                               v
++--------------------------------------------------------+
+|             Centralized Broker: Redis Queue            |
+|                Key: "alerting:queue"                   |
++---------------------------+----------------------------+
+                            |
+                            | (BLPOP pops alert immediately)
+                            v
++---------------------------+----------------------------+
+|             Alert Processing Worker Daemon             |
+|                                                        |
+|  1. Executes Lua script: checkRateLimit(fingerprint)    |
++---------------------------+----------------------------+
+                            |
+      +---------------------+---------------------+
+      | (If Allowed: < limit)                     | (If Throttled: >= limit)
+      v                                           v
++-----+-----------------+                   +-----+-----------------+
+| Twilio SMS Gateway    |                   | Mock Console Logger   |
+| (Dispatched to Phone) |                   | (Suppressed message)  |
++-----------------------+                   +-----------------------+
 ```
 
 ### Key Architectural Decisions
 
 1. **Redis List (`BLPOP`) vs. Pub/Sub:** 
-   Standard Redis Pub/Sub is "fire-and-forget" and lacks queue durability. If a worker pool crashes or restarts, all in-flight alerts are lost. By using a Redis List, we gain a durable queue where messages persist until a worker consumes them. We utilize `BLPOP` (Blocking Left Pop) to block the worker connection until an item is available, achieving sub-millisecond dispatch latency without CPU-heavy polling loops.
+   Standard Redis Pub/Sub is a "fire-and-forget" protocol; it does not persist messages. If your worker pool restarts or crashes during an incident, all alerts published in that window are lost. Using a Redis List as a queue provides durability. The worker daemon uses `BLPOP` (Blocking Left Pop), which blocks the connection and waits. When an item is pushed onto the queue, Redis immediately forwards it to the worker, achieving sub-millisecond dispatch latency without CPU busy-waiting.
 2. **Sliding-Window Log vs. Token Bucket:**
-   Token Bucket algorithms work well for global API rate limiting, but they suffer from reset-boundary spikes and do not track the precise timestamps of individual alerts. The **Sliding Window Log** algorithm tracks every execution timestamp within a rolling window. This provides exact cooldown tracking, enabling us to tell an engineer precisely *when* their alerting block will clear.
+   Token Bucket algorithms work well for global API throttling but suffer from "boundary spikes"—where double the limit can leak through during the boundary reset window. The **Sliding Window Log** tracks the exact timestamp of every request in a rolling window (using a Redis Sorted Set). This provides precise cooldown tracking, letting us notify engineers exactly when the rate-limiting block will clear.
 3. **Atomic Lua Script Execution:**
-   In a distributed environment where multiple worker instances pull from the queue, a naive "read current count, then conditionally increment" pattern introduces critical race conditions. We write our sliding-window logic in Lua and register it with Redis using `defineCommand`. Redis executes Lua scripts in a single-threaded block, ensuring our prune-and-check operations remain fully atomic across all cluster nodes.
+   In a distributed system with multiple worker instances, a "read current count, then conditionally increment" pattern introduces critical race conditions (e.g. two workers allowing a fourth alert simultaneously). Registering our logic as a Lua script using `ioredis.defineCommand` ensures that the entire prune-count-insert-expire sequence runs atomically in a single execution thread inside Redis.
 
 ---
 
@@ -51,30 +59,29 @@ graph TD
 
 To follow this tutorial, ensure your local environment contains:
 * **Node.js**: v20.x or higher
-* **TypeScript**: v5.x or higher
-* **Redis**: v7.x or higher (A local server running on `127.0.0.1:6379`)
-* **Twilio Account**: Optional (The codebase automatically falls back to an interactive console mock mode if placeholders are detected in `.env`)
+* **Docker**: v20.10.x or higher (For running Redis in a clean container)
+* **Twilio Account**: Optional (The codebase automatically falls back to an interactive console mock mode if placeholders are detected in your `.env`)
 
 ### Project Dependencies
 
-All dependencies are locked to exact versions inside `package.json`:
+Dependencies are pinned to exact versions inside `package.json` to guarantee reproducible builds:
 
 | Package | Version | Purpose |
 | :--- | :--- | :--- |
-| `ioredis` | `5.4.1` | High-performance Redis driver supporting Lua scripts and custom command definitions. |
-| `twilio` | `5.13.1` | Official Twilio Node helper SDK for Programmable SMS. |
-| `dotenv` | `16.4.5` | Strict configuration parsing from environment files. |
-| `tsx` | `4.7.2` | High-speed TypeScript execution engine for development and testing. |
+| `ioredis` | `5.4.1` | High-performance Redis driver supporting custom Lua commands. |
+| `twilio` | `5.13.1` | Official Twilio helper SDK for Programmable SMS. |
+| `dotenv` | `16.4.5` | Environment variables loader. |
+| `tsx` | `4.7.2` | High-speed TypeScript execution engine. |
 
 ---
 
 ## Step-by-Step Implementation
 
-### Step 1: Project Initialization
+*All commands must be executed from the repository root directory unless otherwise specified.*
 
-First, let's look at the configuration requirements for Node and TypeScript. The TypeScript compiler is configured in strict mode, targeting modern `ES2022` syntax.
+### Step 1: Project Configuration
 
-Create `package.json`:
+Create `package.json` to lock down dependencies and establish scripts:
 
 ```json
 {
@@ -101,7 +108,7 @@ Create `package.json`:
 }
 ```
 
-Create `tsconfig.json`:
+Create `tsconfig.json` to configure strict type-safety checks:
 
 ```json
 {
@@ -125,9 +132,9 @@ Create `tsconfig.json`:
 
 ---
 
-### Step 2: Declare Domain Types
+### Step 2: Define Domain Types
 
-Define the data structures representing alert payloads and rate limiter states. We define a unique `fingerprint` string for each alert. This fingerprint serves as our partitioning key for rate-limiting (e.g., grouping database errors separately from web frontend warnings).
+Define the structures representing our alerting payloads and rate limiting boundaries.
 
 Create `src/types.ts`:
 
@@ -135,31 +142,31 @@ Create `src/types.ts`:
 export type AlertSeverity = 'INFO' | 'WARNING' | 'CRITICAL';
 
 export interface AlertEvent {
-  id: string;         // Unique event UUID
-  source: string;     // Generating microservice (e.g. 'auth-service')
+  id: string;          // Unique event UUID
+  source: string;      // Generating service (e.g. 'auth-service')
   severity: AlertSeverity;
-  message: string;    // Raw error details
-  timestamp: number;  // Unix epoch timestamp in milliseconds
-  fingerprint: string; // Incident signature for rate-limiting segregation
+  message: string;     // Raw error details
+  timestamp: number;   // Unix epoch timestamp in milliseconds
+  fingerprint: string; // Signature used to partition rate-limiting limits
 }
 
 export interface RateLimitConfig {
-  windowSeconds: number; // Duration of the sliding window
+  windowSeconds: number; // Rolling window duration
   maxRequests: number;   // Maximum allowed executions within the window
 }
 
 export interface RateLimitResult {
   allowed: boolean;
   currentCount: number;
-  ttlRemaining: number; // Time remaining (seconds) until the rate-limiter cooldown expires
+  ttlRemaining: number; // Time remaining (seconds) until the rate-limit block expires
 }
 ```
 
 ---
 
-### Step 3: Configure Environment Loading
+### Step 3: Implement Environment Validation & Mock Detection
 
-The configuration manager loads variables from the `.env` file, validates presence, and exports type-safe environment parameters. It also detects whether the user is utilizing default Twilio sandbox credentials to handle the simulation mode fallback.
+The configuration layer validates required variables and implements **holistic mock detection**. It checks the structure of your credentials (ensuring the Account SID matches Twilio's standard length, the token is 32 hex digits, and the sender is a valid E.164 phone number). If validation fails, it defaults to mock mode, preventing cryptic connection or authentication crashes.
 
 Create `src/config.ts`:
 
@@ -173,48 +180,91 @@ dotenv.config({ path: path.resolve(__dirname, '../.env') });
 function getEnvOrThrow(name: string): string {
   const value = process.env[name];
   if (!value) {
-    throw new Error(`CRITICAL: Environment variable '${name}' is missing.`);
+    throw new Error(
+      `FATAL: Required environment variable '${name}' is not set.\n` +
+      `  Copy .env.example to .env and fill in your values:\n` +
+      `  cp .env.example .env`
+    );
   }
   return value;
 }
 
 const rawAccountSid = getEnvOrThrow('TWILIO_ACCOUNT_SID');
 const rawAuthToken = getEnvOrThrow('TWILIO_AUTH_TOKEN');
+const rawPhoneNumber = getEnvOrThrow('TWILIO_PHONE_NUMBER');
+const rawRecipient = getEnvOrThrow('ALERT_RECIPIENT_PHONE_NUMBER');
 
-// Evaluate if credentials are the default placeholders
-const isTwilioMock = 
-  rawAccountSid.startsWith('ACXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX') || 
-  rawAuthToken === 'your_auth_token_here';
+/**
+ * Holistic mock detection: ALL three Twilio credentials must look real.
+ * - Account SID must start with "AC" and be 34 chars (Twilio standard format)
+ * - Auth Token must be 32 hex characters
+ * - Phone Number must be E.164 format (+ followed by digits only)
+ *
+ * If ANY credential fails validation, we default to mock mode. This prevents
+ * a half-configured .env from attempting live API calls that crash with
+ * confusing Twilio error codes (21211, 20003, etc).
+ */
+function detectMockMode(): { isMock: boolean; reason: string } {
+  const sidValid = /^AC[0-9a-f]{32}$/i.test(rawAccountSid);
+  if (!sidValid) {
+    return { isMock: true, reason: `TWILIO_ACCOUNT_SID is not a valid 34-char SID (got "${rawAccountSid.substring(0, 6)}...")` };
+  }
+
+  const tokenValid = /^[0-9a-f]{32}$/i.test(rawAuthToken);
+  if (!tokenValid) {
+    return { isMock: true, reason: 'TWILIO_AUTH_TOKEN is not a valid 32-char hex token' };
+  }
+
+  const phoneValid = /^\+[1-9]\d{1,14}$/.test(rawPhoneNumber);
+  if (!phoneValid) {
+    return { isMock: true, reason: `TWILIO_PHONE_NUMBER is not valid E.164 format (got "${rawPhoneNumber}")` };
+  }
+
+  return { isMock: false, reason: 'All Twilio credentials passed format validation' };
+}
+
+const mockDetection = detectMockMode();
+
+// Validate recipient phone format and warn at import time
+const recipientValid = /^\+[1-9]\d{1,14}$/.test(rawRecipient);
+if (!recipientValid) {
+  console.warn(
+    `\x1b[33m[CONFIG WARNING]\x1b[0m ALERT_RECIPIENT_PHONE_NUMBER "${rawRecipient}" ` +
+    `does not look like a valid E.164 phone number. SMS delivery will fail in live mode.`
+  );
+}
 
 export const config = {
   twilio: {
     accountSid: rawAccountSid,
     authToken: rawAuthToken,
-    phoneNumber: getEnvOrThrow('TWILIO_PHONE_NUMBER'),
-    isMock: isTwilioMock,
+    phoneNumber: rawPhoneNumber,
+    isMock: mockDetection.isMock,
+    mockReason: mockDetection.reason,
   },
   alert: {
-    recipientPhoneNumber: getEnvOrThrow('ALERT_RECIPIENT_PHONE_NUMBER'),
-    // Limit alerts of a single fingerprint to max 3 per 60 seconds
+    recipientPhoneNumber: rawRecipient,
     windowSeconds: 60,
     maxRequests: 3,
   },
   redis: {
     url: getEnvOrThrow('REDIS_URL'),
     queueKey: 'alerting:queue',
+    deadLetterKey: 'alerting:dead-letter',
   },
 };
 ```
 
 ---
 
-### Step 4: Implement the Redis Sliding-Window Rate Limiter
+### Step 4: Write the Atomic Sliding-Window Lua Script
 
-We implement the rate limiter using a Redis Sorted Set (ZSET). The key of the ZSET is built around the alert fingerprint. 
-* The **score** represents the millisecond timestamp when the alert arrived.
-* The **member** value is the unique `id` of the alert. (Using the unique alert ID instead of the timestamp prevents concurrent alerts arriving at the same millisecond from overwriting each other).
+Our rate limiter utilizes a Redis Sorted Set (ZSET). The alert `fingerprint` is the key, the millisecond timestamp is the `score`, and a unique UUID is the `member`.
 
-The logic runs atomically in Redis via a Lua script loaded via `ioredis.defineCommand`:
+We execute the operations inside a single Lua script block:
+1. **Prune Before Count:** The script must run `ZREMRANGEBYSCORE` *before* the cardinality count. If a client queries the limiter at `T=120,000ms` with a `60s` window, and the set contains entries at `T=50,000ms`, `T=80,000ms`, and `T=90,000ms`, the prune removes `T=50,000ms` (since `120000 - 60000 = 60000` is the lower boundary). The count drops to 2. If we counted before pruning, the request would be blocked.
+2. **Conditional Expire:** If a request is allowed, we add it to the ZSET. Regardless of whether it's blocked or allowed, we call `PEXPIRE` to refresh the key's TTL. If we only set expiration on write, a crash between the write and the expiration could leave the key orphan in Redis forever, permanently blocking alerts for that fingerprint. Setting TTL always ensures the key self-cleans.
+3. **Atomic Cooldown Retrieval:** If a request is blocked, we find the oldest entry's timestamp in the same execution. This eliminates a second round-trip `zrange` call, preventing race conditions where the ZSET changes between checks.
 
 Create `src/limiter.ts`:
 
@@ -222,7 +272,6 @@ Create `src/limiter.ts`:
 import Redis from 'ioredis';
 import { RateLimitConfig, RateLimitResult } from './types';
 
-// Extend ioredis client definition to support type-safe execution of our custom Lua command
 declare module 'ioredis' {
   interface Redis {
     checkRateLimit(
@@ -231,7 +280,7 @@ declare module 'ioredis' {
       windowMs: string,
       maxRequests: string,
       memberId: string
-    ): Promise<[number, number]>;
+    ): Promise<[number, number, number]>;
   }
 }
 
@@ -241,7 +290,6 @@ export class DistributedRateLimiter {
   constructor(redisClient: Redis) {
     this.redis = redisClient;
 
-    // Register our custom Lua script command with ioredis
     this.redis.defineCommand('checkRateLimit', {
       numberOfKeys: 1,
       lua: `
@@ -251,33 +299,35 @@ export class DistributedRateLimiter {
         local maxRequests = tonumber(ARGV[3])
         local memberId = ARGV[4]
 
-        -- Prune logs older than current window boundary
+        -- 1. Prune logs older than current window boundary
         redis.call('ZREMRANGEBYSCORE', key, '-inf', now - windowMs)
 
-        -- Determine volume of remaining requests
+        -- 2. Count remaining elements inside the window
         local currentCount = redis.call('ZCARD', key)
 
         local allowed = 0
+        local oldestScore = 0
         if currentCount < maxRequests then
-          -- Add request log with score = current time, member = unique ID
+          -- 3a. Add request log
           redis.call('ZADD', key, now, memberId)
-          -- Set TTL to match the window duration to prevent key accumulation
-          redis.call('PEXPIRE', key, windowMs)
           currentCount = currentCount + 1
           allowed = 1
+        else
+          -- 3b. Read the oldest log's timestamp to compute cooldown atomically
+          local oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
+          if oldest and #oldest == 2 then
+            oldestScore = tonumber(oldest[2])
+          end
         end
 
-        return {allowed, currentCount}
+        -- 4. Always set TTL on the key to prevent orphaned keys on process crash
+        redis.call('PEXPIRE', key, windowMs)
+
+        return {allowed, currentCount, oldestScore}
       `,
     });
   }
 
-  /**
-   * Check if a specific alert fingerprint is within limits
-   * @param fingerprint Unique identifier of the alert type
-   * @param config Configuration for the rate limit
-   * @param alertId Unique alert identifier to act as member in the sorted set
-   */
   public async check(
     fingerprint: string,
     config: RateLimitConfig,
@@ -287,8 +337,8 @@ export class DistributedRateLimiter {
     const now = Date.now();
     const windowMs = config.windowSeconds * 1000;
 
-    // Invoke the custom script command
-    const [allowedRaw, currentCount] = await this.redis.checkRateLimit(
+    // Single atomic round trip
+    const [allowedRaw, currentCount, oldestScore] = await this.redis.checkRateLimit(
       key,
       now.toString(),
       windowMs.toString(),
@@ -298,15 +348,10 @@ export class DistributedRateLimiter {
 
     const allowed = allowedRaw === 1;
 
-    // Calculate the remaining TTL of the oldest item in the set
     let ttlRemaining = config.windowSeconds;
-    if (!allowed) {
-      const oldestArray = await this.redis.zrange(key, 0, 0, 'WITHSCORES');
-      if (oldestArray.length === 2) {
-        const oldestTimestamp = parseInt(oldestArray[1], 10);
-        const timePassed = now - oldestTimestamp;
-        ttlRemaining = Math.max(0, Math.ceil((windowMs - timePassed) / 1000));
-      }
+    if (!allowed && oldestScore > 0) {
+      const timePassed = now - oldestScore;
+      ttlRemaining = Math.max(0, Math.ceil((windowMs - timePassed) / 1000));
     }
 
     return {
@@ -320,9 +365,9 @@ export class DistributedRateLimiter {
 
 ---
 
-### Step 5: Implement the Twilio SMS Gateway
+### Step 5: Implement the SMS Gateway Wrapper
 
-The Twilio client wraps the official SDK and handles live connection errors. It switches automatically to a mock logger output if it detects sandbox credentials in the environment config.
+The gateway handles Twilio communications. It translates common error codes (e.g. `20003` for auth issues, `21211` for phone formatting) into human-readable suggestions.
 
 Create `src/twilio.ts`:
 
@@ -338,21 +383,17 @@ export class TwilioService {
       try {
         this.client = twilio(config.twilio.accountSid, config.twilio.authToken);
       } catch (err: any) {
-        console.error('Failed to initialize live Twilio client. Switching to mock mode.', err.message);
+        console.error(
+          '\x1b[31m[TWILIO INIT ERROR]\x1b[0m Failed to initialize Twilio client:', err.message,
+          '\n  Falling back to mock mode.'
+        );
         config.twilio.isMock = true;
       }
     }
   }
 
-  /**
-   * Dispatches SMS alert notification
-   * @param to Recipient phone number in E.164 format
-   * @param body Text message body
-   * @returns Twilio Message SID string
-   */
   public async sendSms(to: string, body: string): Promise<string> {
     if (config.twilio.isMock || !this.client) {
-      // Simulate network roundtrip latency
       await new Promise((resolve) => setTimeout(resolve, 150));
       const mockSid = `SMmock_${Math.random().toString(36).substring(2, 17)}`;
       console.log(
@@ -378,10 +419,19 @@ export class TwilioService {
     } catch (error: any) {
       const errorCode = error.code || 'UNKNOWN';
       const errorMessage = error.message || 'No details provided';
-      
+
+      let hint = '';
+      if (errorCode === 20003) {
+        hint = '\n  Hint: Authentication failed. Verify TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN in your .env file.';
+      } else if (errorCode === 21211) {
+        hint = '\n  Hint: Invalid "To" phone number. Ensure ALERT_RECIPIENT_PHONE_NUMBER is in E.164 format (+1234567890).';
+      } else if (errorCode === 21608 || errorCode === 21610) {
+        hint = '\n  Hint: The "From" number is not verified or not SMS-capable. Check TWILIO_PHONE_NUMBER in your .env file.';
+      }
+
       console.error(
         `\x1b[31m[TWILIO ERROR]\x1b[0m Failed SMS delivery to ${to}. ` +
-        `Code: ${errorCode} - Message: ${errorMessage}`
+        `Code: ${errorCode} - ${errorMessage}${hint}`
       );
 
       throw new Error(`Twilio dispatch failure: [${errorCode}] ${errorMessage}`);
@@ -392,13 +442,12 @@ export class TwilioService {
 
 ---
 
-### Step 6: Create the Alert Processing Worker Daemon
+### Step 6: Create the Worker Queue Daemon
 
-The worker process runs continuously. It opens two connections to Redis:
-1. `redisBlocking`: Solely for execution of the blocking `BLPOP` call.
-2. `redisMain`: Standard operations, including sliding window log checks.
-
-We intercept `SIGINT` and `SIGTERM` signals to shut down the worker gracefully. The daemon closes the blocking connection immediately to abort any current wait, allows in-flight operations to execute, closes the main connection, and terminates.
+The queue consumer runs continuously in the background. 
+* It instantiates the blocking connection with `maxRetriesPerRequest: null`, ensuring that `BLPOP` can remain blocked indefinitely without `ioredis` timing out and failing the connection.
+* If Redis drops mid-`BLPOP`, the worker sleeps for 2 seconds to avoid CPU log-spam while `ioredis` automatically handles the TCP reconnection in the background.
+* It includes a **Dead-Letter Queue (DLQ)** handler inside the parsing check. Any corrupted or unparseable payloads are written to the `alerting:dead-letter` key, ensuring that debug data is never lost.
 
 Create `src/worker.ts`:
 
@@ -417,8 +466,14 @@ class AlertWorker {
   private isShuttingDown = false;
 
   constructor() {
-    this.redisMain = new Redis(config.redis.url);
-    this.redisBlocking = new Redis(config.redis.url);
+    this.redisMain = new Redis(config.redis.url, {
+      maxRetriesPerRequest: null, // Essential for BLPOP blocking
+      enableReadyCheck: true,
+    });
+    this.redisBlocking = new Redis(config.redis.url, {
+      maxRetriesPerRequest: null,
+      enableReadyCheck: true,
+    });
     
     this.limiter = new DistributedRateLimiter(this.redisMain);
     this.twilio = new TwilioService();
@@ -429,6 +484,7 @@ class AlertWorker {
 
   private setupErrorHandlers() {
     const logConnectionError = (type: string, error: any) => {
+      if (this.isShuttingDown) return;
       console.error(`\x1b[31m[REDIS ERROR - ${type}]\x1b[0m Connection error:`, error.message);
     };
 
@@ -443,10 +499,7 @@ class AlertWorker {
       
       console.log(`\n\x1b[33m[SHUTDOWN]\x1b[0m Received ${signal}. Cleaning up connections...`);
       
-      // Terminate blocked connection
       this.redisBlocking.disconnect();
-      
-      // Let current commands finish, then quit main client
       await this.redisMain.quit();
       
       console.log('\x1b[32m[SHUTDOWN]\x1b[0m Clean shutdown complete.');
@@ -457,19 +510,25 @@ class AlertWorker {
     process.on('SIGTERM', () => shutdown('SIGTERM'));
   }
 
-  /**
-   * Main polling loop using blocking pop to consume alerts
-   */
   public async start() {
+    if (config.alert.recipientPhoneNumber === '+1234567890') {
+      console.warn(
+        '\x1b[33m[CONFIG WARNING]\x1b[0m ALERT_RECIPIENT_PHONE_NUMBER is set to the ' +
+        'placeholder value "+1234567890". SMS will not be delivered in live mode.\n' +
+        '  Update your .env file with a real phone number.\n'
+      );
+    }
+
     console.log('\x1b[32m[WORKER]\x1b[0m Alert Worker Daemon initialized.');
     console.log(`[WORKER] Monitoring queue: "${config.redis.queueKey}"`);
-    console.log(`[WORKER] SMS Mode: ${config.twilio.isMock ? 'SIMULATED' : 'LIVE'}`);
+    console.log(`[WORKER] SMS Mode: ${config.twilio.isMock ? '\x1b[36mSIMULATED\x1b[0m' : '\x1b[32mLIVE\x1b[0m'}`);
+    console.log(`[WORKER] Mode reason: ${config.twilio.mockReason}`);
     console.log(`[WORKER] Recipient: ${config.alert.recipientPhoneNumber}`);
-    console.log(`[WORKER] Rate limit rules: Max ${config.alert.maxRequests} per ${config.alert.windowSeconds}s per fingerprint.\n`);
+    console.log(`[WORKER] Rate limit: Max ${config.alert.maxRequests} per ${config.alert.windowSeconds}s per fingerprint`);
+    console.log(`[WORKER] Dead-letter queue: "${config.redis.deadLetterKey}"\n`);
 
     while (!this.isShuttingDown) {
       try {
-        // BLPOP blocks connection until an item is pushed on the queue
         const result = await this.redisBlocking.blpop(config.redis.queueKey, 0);
         
         if (!result || this.isShuttingDown) continue;
@@ -480,7 +539,6 @@ class AlertWorker {
         if (this.isShuttingDown) break;
         
         console.error('\x1b[31m[WORKER ERROR]\x1b[0m Error during polling loop:', error.message);
-        // Exponential backoff to avoid hot-looping during DB outage
         await new Promise((resolve) => setTimeout(resolve, 2000));
       }
     }
@@ -492,7 +550,15 @@ class AlertWorker {
     try {
       alert = JSON.parse(payload);
     } catch (err) {
-      console.error('\x1b[31m[WORKER ERROR]\x1b[0m Failed to parse alert payload JSON:', payload);
+      console.error(
+        '\x1b[31m[DEAD LETTER]\x1b[0m Failed to parse alert payload. ' +
+        'Moving to dead-letter queue:', payload.substring(0, 200)
+      );
+      try {
+        await this.redisMain.rpush(config.redis.deadLetterKey, payload);
+      } catch (dlqErr: any) {
+        console.error('\x1b[31m[DEAD LETTER ERROR]\x1b[0m Could not write to dead-letter queue:', dlqErr.message);
+      }
       return;
     }
 
@@ -503,7 +569,6 @@ class AlertWorker {
     );
 
     try {
-      // Evaluate rate limits
       const limitResult = await this.limiter.check(
         alert.fingerprint,
         { windowSeconds: config.alert.windowSeconds, maxRequests: config.alert.maxRequests },
@@ -519,7 +584,6 @@ class AlertWorker {
         return;
       }
 
-      // Format alert message payload for SMS readability
       const smsBody = `Alert: [${alert.severity}] [${alert.source}] ${alert.message} (Ref: ${alert.id.substring(0, 8)})`;
       
       const messageSid = await this.twilio.sendSms(
@@ -539,14 +603,17 @@ class AlertWorker {
 }
 
 const worker = new AlertWorker();
-worker.start();
+worker.start().catch((err) => {
+  console.error('\x1b[31m[FATAL]\x1b[0m Worker failed to start:', err.message);
+  process.exit(1);
+});
 ```
 
 ---
 
-### Step 7: Build the Producer Publisher client
+### Step 7: Create the Alert Publisher Utility
 
-The producer represents a service that detects an anomaly and reports it. It generates a cryptographic UUID for the alert and calculates a SHA-256 fingerprint automatically if one is not provided.
+Create a client wrapper that microservices use to queue events.
 
 Create `src/publisher.ts`:
 
@@ -566,11 +633,6 @@ export class AlertPublisher {
     });
   }
 
-  /**
-   * Publishes an alert event to the centralized Redis queue
-   * @param alert Details of the alert event
-   * @returns Generated alert ID
-   */
   public async publish(alert: {
     source: string;
     severity: AlertSeverity;
@@ -580,7 +642,6 @@ export class AlertPublisher {
     const id = crypto.randomUUID();
     const timestamp = Date.now();
     
-    // Auto-generate stable fingerprint if not provided (excludes dynamic message detail)
     const fingerprint = alert.fingerprint || 
       crypto.createHash('sha256')
         .update(`${alert.source}:${alert.severity}`)
@@ -596,8 +657,6 @@ export class AlertPublisher {
     };
 
     const payload = JSON.stringify(alertEvent);
-    
-    // RPUSH pushes message onto the tail of the list queue
     await this.redis.rpush(config.redis.queueKey, payload);
     
     return id;
@@ -655,142 +714,113 @@ if (require.main === module) {
 
 ---
 
-## Testing the Implementation
+## Cold-Clone Verification
 
-To test the system locally, we will execute a script that cleans existing keys in Redis and publishes a burst of 5 identical database failures along with 1 isolated out-of-memory alert.
+Follow these steps exactly to run and test the pipeline on a clean machine:
 
-Create `src/test-pipeline.ts`:
-
-```typescript
-import Redis from 'ioredis';
-import { config } from './config';
-import { AlertPublisher } from './publisher';
-
-async function runTestSimulation() {
-  console.log('\x1b[35m[TEST-RUNNER]\x1b[0m Connecting to Redis to reset pipeline state...');
-  const redis = new Redis(config.redis.url);
-  
-  try {
-    const keys = await redis.keys('rate_limit:*');
-    if (keys.length > 0) {
-      await redis.del(...keys);
-    }
-    await redis.del(config.redis.queueKey);
-    console.log('\x1b[35m[TEST-RUNNER]\x1b[0m Cleaned up existing rate limits and queues.');
-
-    const publisher = new AlertPublisher();
-
-    console.log('\n\x1b[35m[TEST-RUNNER]\x1b[0m Publishing Alert Burst: 5 identical database failures...');
-    
-    // We send 5 database alerts. 1, 2, 3 should process; 4 and 5 must be throttled.
-    const dbFingerprint = 'db_connection_fail';
-    for (let i = 1; i <= 5; i++) {
-      const alertId = await publisher.publish({
-        source: 'database-cluster',
-        severity: 'CRITICAL',
-        message: `Connection pool exhausted - active connections > 100 [Burst #${i}]`,
-        fingerprint: dbFingerprint,
-      });
-      console.log(`  -> Queued [Burst #${i}] ID: ${alertId}`);
-    }
-
-    console.log('\n\x1b[35m[TEST-RUNNER]\x1b[0m Publishing 1 alternative alert (OOM) with different fingerprint...');
-    // This should immediately succeed, proving rate limit isolation per fingerprint
-    const oomAlertId = await publisher.publish({
-      source: 'web-server',
-      severity: 'WARNING',
-      message: 'Node process memory consumption exceeded 85%',
-      fingerprint: 'oom_warning',
-    });
-    console.log(`  -> Queued [OOM] ID: ${oomAlertId}`);
-
-    await publisher.close();
-    console.log('\n\x1b[32m[TEST-RUNNER] Simulation payload successfully queued.\x1b[0m');
-    
-  } catch (error: any) {
-    console.error('\x1b[31m[TEST-RUNNER ERROR]\x1b[0m Simulation run crashed:', error.message);
-  } finally {
-    await redis.quit();
-  }
-}
-
-runTestSimulation();
+### 1. Start Infrastructure
+Start the Redis server using Docker Compose. The configuration contains a health check to guarantee Redis is fully loaded:
+```bash
+docker compose up -d
 ```
 
-### Execution Steps
+### 2. Install Dependencies & Build
+Install packages and compile:
+```bash
+npm install
+npm run build
+```
 
-1. Configure environment files. Copy `.env.example` to `.env` and configure your credentials, or keep default values to run mock simulations.
-2. Open terminal #1 and spin up the worker daemon:
-   ```bash
-   npm run worker
-   ```
-3. Open terminal #2 and execute the load simulation pipeline runner:
-   ```bash
-   npm run test-pipeline
-   ```
+### 3. Setup Configuration
+Copy the environment template:
+```bash
+cp .env.example .env
+```
+*(Keep the default values inside `.env` to execute in mock simulation mode.)*
 
-### Expected Output
+### 4. Execute the Worker Daemon
+Open **Terminal 1** and start the worker daemon:
+```bash
+npm run worker
+```
 
-In Terminal #1, you will observe the worker process:
-1. Accept the first three database alerts and dispatch SMS notifications.
-2. Successfully intercept and suppress the fourth and fifth database alerts, logging their cooldown status.
-3. Deliver the isolated `oom_warning` alert without delay.
-
+**Expected Startup Output:**
 ```text
+[CONFIG WARNING] ALERT_RECIPIENT_PHONE_NUMBER is set to the placeholder value "+1234567890". SMS will not be delivered in live mode.
+  Update your .env file with a real phone number.
+
 [WORKER] Alert Worker Daemon initialized.
 [WORKER] Monitoring queue: "alerting:queue"
 [WORKER] SMS Mode: SIMULATED
+[WORKER] Mode reason: TWILIO_ACCOUNT_SID is not a valid 34-char SID (got "ACXXXX...")
 [WORKER] Recipient: +1234567890
-[WORKER] Rate limit rules: Max 3 per 60s per fingerprint.
+[WORKER] Rate limit: Max 3 per 60s per fingerprint
+[WORKER] Dead-letter queue: "alerting:dead-letter"
+```
 
-[PROCESSING] Received alert [3a9bafff-5bdf-453a-b773-c570b2e3708b] Source: database-cluster | Severity: CRITICAL | Fingerprint: db_connection_fail
+### 5. Run the Simulation Burst
+Open **Terminal 2** and trigger the test pipeline:
+```bash
+npm run test-pipeline
+```
+
+**Expected Output in Terminal 2:**
+```text
+[TEST-RUNNER] Connecting to Redis...
+[TEST-RUNNER] Cleaned up existing rate limits and queues.
+
+[TEST-RUNNER] Publishing Alert Burst: 5 identical database failures...
+  -> Queued [Burst #1] ID: 278e3fa2-0052-42ba-aa58-c70571c99311
+  ...
+[TEST-RUNNER] Simulation complete.
+```
+
+**Expected Log in Terminal 1 (Worker):**
+You will observe the worker process:
+1. Dispatch SMS alerts for the first 3 identical database issues.
+2. Intercept and block the 4th and 5th database alerts, printing the remaining cooldown duration.
+3. Successfully process and dispatch the isolated `oom_warning` alert, demonstrating partition safety.
+
+```text
+[PROCESSING] Received alert [278e3fa2...] Source: database-cluster | Severity: CRITICAL | Fingerprint: db_connection_fail
 [MOCK TWILIO SMS] Sent Alert Message to +1234567890.
-  Body: "Alert: [CRITICAL] [database-cluster] Connection pool exhausted - active connections > 100 [Burst #1] (Ref: 3a9bafff)"
-  SID: SMmock_gdwxevvtzhl
-[SUCCESS] Alert [3a9bafff-5bdf-453a-b773-c570b2e3708b] processed. SMS SID: SMmock_gdwxevvtzhl | Limit status: 1/3 | Time: 161ms
+  Body: "Alert: [CRITICAL] [database-cluster] Connection pool exhausted - active connections > 100 [Burst #1] (Ref: 278e3fa2)"
+  SID: SMmock_r40fcrlc6tn
+[SUCCESS] Alert [278e3fa2...] processed. SMS SID: SMmock_r40fcrlc6tn | Limit status: 1/3 | Time: 153ms
 
-[PROCESSING] Received alert [c0abd8c4-843b-4e5c-9931-f4441033163f] Source: database-cluster | Severity: CRITICAL | Fingerprint: db_connection_fail
-[MOCK TWILIO SMS] Sent Alert Message to +1234567890.
-  Body: "Alert: [CRITICAL] [database-cluster] Connection pool exhausted - active connections > 100 [Burst #2] (Ref: c0abd8c4)"
-  SID: SMmock_ph6x8t4oi4a
-[SUCCESS] Alert [c0abd8c4-843b-4e5c-9931-f4441033163f] processed. SMS SID: SMmock_ph6x8t4oi4a | Limit status: 2/3 | Time: 152ms
+[PROCESSING] Received alert [6e14d64b...] Source: database-cluster | Severity: CRITICAL | Fingerprint: db_connection_fail
+[SUCCESS] Alert [6e14d64b...] processed. SMS SID: SMmock_6i4aboqtvp3 | Limit status: 2/3
 
-[PROCESSING] Received alert [85ca145e-f3e5-492b-aa02-ef77832f149f] Source: database-cluster | Severity: CRITICAL | Fingerprint: db_connection_fail
-[MOCK TWILIO SMS] Sent Alert Message to +1234567890.
-  Body: "Alert: [CRITICAL] [database-cluster] Connection pool exhausted - active connections > 100 [Burst #3] (Ref: 85ca145e)"
-  SID: SMmock_g19vyj1dd8s
-[SUCCESS] Alert [85ca145e-f3e5-492b-aa02-ef77832f149f] processed. SMS SID: SMmock_g19vyj1dd8s | Limit status: 3/3 | Time: 153ms
+[PROCESSING] Received alert [81462b81...] Source: database-cluster | Severity: CRITICAL | Fingerprint: db_connection_fail
+[SUCCESS] Alert [81462b81...] processed. SMS SID: SMmock_axpntu0prnu | Limit status: 3/3
 
-[PROCESSING] Received alert [4527c927-2fa4-4237-ac71-0cd9770aeafb] Source: database-cluster | Severity: CRITICAL | Fingerprint: db_connection_fail
-[SUPPRESSED] Alert [4527c927-2fa4-4237-ac71-0cd9770aeafb] throttled. Limit exceeded (3/3 in 60s). Cooldown remaining: 60s
+[PROCESSING] Received alert [a199b846...] Source: database-cluster | Severity: CRITICAL | Fingerprint: db_connection_fail
+[SUPPRESSED] Alert [a199b846...] throttled. Limit exceeded (3/3 in 60s). Cooldown remaining: 60s
 
-[PROCESSING] Received alert [dd4aaaaa-24cb-45c6-bcb9-8dc912104429] Source: database-cluster | Severity: CRITICAL | Fingerprint: db_connection_fail
-[SUPPRESSED] Alert [dd4aaaaa-24cb-45c6-bcb9-8dc912104429] throttled. Limit exceeded (3/3 in 60s). Cooldown remaining: 60s
+[PROCESSING] Received alert [d8b6138a...] Source: database-cluster | Severity: CRITICAL | Fingerprint: db_connection_fail
+[SUPPRESSED] Alert [d8b6138a...] throttled. Limit exceeded (3/3 in 60s). Cooldown remaining: 60s
 
-[PROCESSING] Received alert [1a8c3303-85e3-438f-9995-88b27adf57d5] Source: web-server | Severity: WARNING | Fingerprint: oom_warning
-[MOCK TWILIO SMS] Sent Alert Message to +1234567890.
-  Body: "Alert: [WARNING] [web-server] Node process memory consumption exceeded 85% (Ref: 1a8c3303)"
-  SID: SMmock_otr1bbue8j8
-[SUCCESS] Alert [1a8c3303-85e3-438f-9995-88b27adf57d5] processed. SMS SID: SMmock_otr1bbue8j8 | Limit status: 1/3 | Time: 151ms
+[PROCESSING] Received alert [72fde672...] Source: web-server | Severity: WARNING | Fingerprint: oom_warning
+[SUCCESS] Alert [72fde672...] processed. SMS SID: SMmock_l8xm477jjm | Limit status: 1/3 | Time: 151ms
 ```
 
 ---
 
 ## Production Considerations
 
-To deploy this alerting microservice to a high-scale production environment, consider the following hardening guidelines:
+To deploy this microservice to high-throughput environments, evaluate the following scaling paradigms:
 
-### 1. Transitioning to Redis Streams and Consumer Groups
-While Redis Lists (`BLPOP`) are fast and lightweight, they lack features for distributed recovery. If a worker fetches a message from the queue and immediately crashes, the message is lost forever. 
-To build a fault-tolerant pipeline, upgrade the queue from a Redis List to **Redis Streams** combined with **Consumer Groups (`XREADGROUP`)**. Redis Streams maintain a **Pending Entries List (PEL)**. If a worker retrieves an alert but fails to acknowledge it (`XACK`) within a specific time window, another worker can claim the alert and process it. This guarantees **at-least-once** delivery.
+### 1. Redis Streams and Consumer Groups
+While Redis Lists (`BLPOP`) are fast, they are not strictly fault-tolerant. If a worker pops an alert and immediately encounters a hardware crash, the message is permanently lost. 
+To guarantee **at-least-once** delivery, transition to **Redis Streams** combined with **Consumer Groups (`XREADGROUP`)**. Redis Streams track a **Pending Entries List (PEL)**. If a worker retrieves an alert but fails to acknowledge it (`XACK`) within a specific window, another worker can claim the alert and process it.
 
-### 2. Hash Tags for Redis Clustering
-When running in a partitioned Redis Cluster, keys are mapped to specific hash slots. If you evaluate a Lua script that references multiple keys (like a rate-limiting key and a tracking log), Redis will throw a `CROSSSLOT Keys in request don't map to the same slot` error if they are routed to different nodes.
-To prevent this, use **Redis hash tags** `{...}` to force related keys onto the same node. For instance, format your keys as `{rate_limit:db_failure}` and `{rate_limit:db_failure}:metadata`. Redis will hash only the bracketed section, guaranteeing they reside on the same cluster host and enabling safe multi-key atomic transactions.
+### 2. Hash Tags for Cluster Compatibility
+In a sharded Redis Cluster, keys are distributed across slots. Evaluating a Lua script referencing multiple keys (like a rate-limiting key and a tracking log) will crash with a `CROSSSLOT` error if they route to different hosts.
+Solve this by wrapping the sharded keys in **hash tags** `{...}`. For example, use `{rate_limit:db_failure}` and `{rate_limit:db_failure}:metadata`. Redis hashes only the bracketed section, forcing both keys onto the same cluster node.
 
 ### 3. Asynchronous SMS Delivery Reconciliation
-The HTTP request to `twilio.messages.create` only tells you that Twilio accepted your request—it does not guarantee the cellular network delivered the message. In production, you must track actual handoff. 
-Provide a `statusCallback` URL parameter in your Twilio SMS dispatch configuration. Set up a lightweight public webhook endpoint (e.g. Express or Fastify on ECS/Lambda) to handle Twilio's asynchronous delivery updates (e.g., `sent`, `delivered`, `failed`, or `undelivered`). If a message status changes to `failed` (which can happen due to carrier filtering or invalid numbers), fallback to alternative channels like Slack webhooks or PagerDuty.
+The HTTP response from `twilio.messages.create` only confirms that Twilio accepted your request, not that the SMS arrived at the handset. 
+Provide a `statusCallback` URL parameter in your Twilio API call to direct events to a public callback hook (e.g. on ECS or AWS Lambda). Track the events (`sent`, `delivered`, `failed`, or `undelivered`). If a delivery changes to `failed` due to carrier routing or invalid formatting, trigger fallback routing to alternative alerting systems like Slack or PagerDuty.
 
 ---
 
@@ -798,4 +828,6 @@ Provide a `statusCallback` URL parameter in your Twilio SMS dispatch configurati
 
 We have engineered a robust, decoupled, and rate-limited alerting system in TypeScript. Rather than bombarding SMS gateways directly, microservices append events asynchronously to a Redis Queue. Dedicated workers process alerts sequentially, using an atomic Lua script to enforce sliding-window rate limits before invoking Twilio.
 
-By decoupling components and using atomic distributed limiters, we protect both the on-call engineer's attention and the system's operational budget.
+This architecture balances decoupling with execution speed. While using a Sliding Window log incurs a higher Redis memory footprint compared to Token Bucket limiters (since we store individual timestamp values), it provides precise, race-free cooldown tracking that is critical for real-time diagnostics. Moving forward, this pipeline can be extended by upgrading the transport layer to Redis Streams for durable message recovery, or by implementing fallback routes to alternative paging channels if Twilio status callbacks report delivery failures. 
+
+By taking control of your alerting traffic, you can protect both your system's operational budget and your engineering team's sleep.
