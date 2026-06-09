@@ -1,0 +1,31 @@
+{
+  "name": "twilio-redis-alerting",
+  "version": "1.0.0",
+  "description": "Distributed Alerting Pipeline with Redis Pub/Sub, Sliding-Window Rate Limiting, and Twilio SMS",
+  "main": "dist/worker.js",
+  "scripts": {
+    "build": "tsc",
+    "worker": "tsx src/worker.ts",
+    "publisher": "tsx src/publisher.ts",
+    "test-pipeline": "tsx src/test-pipeline.ts"
+  },
+  "keywords": [
+    "twilio",
+    "redis",
+    "rate-limiting",
+    "distributed-systems",
+    "typescript"
+  ],
+  "author": "Ebendttl",
+  "license": "MIT",
+  "dependencies": {
+    "dotenv": "16.4.5",
+    "ioredis": "5.4.1",
+    "twilio": "4.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "20.12.7",
+    "tsx": "4.7.2",
+    "typescript": "5.4.5"
+  }
+}
