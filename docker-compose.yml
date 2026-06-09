@@ -1,3 +1,4 @@
+# Spins up an isolated Redis v7 instance for the alerting pipeline. Run with: docker compose up -d
 services:
   redis:
     image: redis:7.2-alpine
