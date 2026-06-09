@@ -3,11 +3,32 @@ import { config } from './config';
 import { AlertPublisher } from './publisher';
 
 async function runTestSimulation() {
-  console.log('\x1b[35m[TEST-RUNNER]\x1b[0m Connecting to Redis to reset pipeline state...');
-  const redis = new Redis(config.redis.url);
-  
+  console.log('\x1b[35m[TEST-RUNNER]\x1b[0m Connecting to Redis...');
+  const redis = new Redis(config.redis.url, {
+    maxRetriesPerRequest: 3,
+    retryStrategy(times: number) {
+      if (times > 3) return null;
+      return Math.min(times * 200, 1000);
+    },
+  });
+
+  redis.on('error', () => {});
+
   try {
-    // Clean slate for test verification
+    await redis.ping();
+  } catch (err: any) {
+    console.error(
+      '\x1b[31m[TEST-RUNNER ERROR]\x1b[0m Cannot connect to Redis at ' +
+      `${config.redis.url}.\n` +
+      '  Ensure Redis is running:\n' +
+      '    docker compose up -d\n' +
+      `  Error: ${err.message}`
+    );
+    redis.disconnect();
+    process.exit(1);
+  }
+
+  try {
     const keys = await redis.keys('rate_limit:*');
     if (keys.length > 0) {
       await redis.del(...keys);
@@ -15,11 +36,23 @@ async function runTestSimulation() {
     await redis.del(config.redis.queueKey);
     console.log('\x1b[35m[TEST-RUNNER]\x1b[0m Cleaned up existing rate limits and queues.');
 
+    const clientList = await redis.client('LIST') as string;
+    const hasBlockedClient = clientList.split('\n').some(
+      (line) => line.includes('cmd=blpop') || line.includes('cmd=BLPOP')
+    );
+
+    if (!hasBlockedClient) {
+      console.warn(
+        '\x1b[33m[TEST-RUNNER WARNING]\x1b[0m No active worker detected on the queue.\n' +
+        '  Alerts will be queued but not processed until you start the worker:\n' +
+        '    npm run worker\n'
+      );
+    }
+
     const publisher = new AlertPublisher();
 
     console.log('\n\x1b[35m[TEST-RUNNER]\x1b[0m Publishing Alert Burst: 5 identical database failures...');
-    
-    // We send 5 database alerts. The first 3 should process; 4 and 5 must be throttled.
+
     const dbFingerprint = 'db_connection_fail';
     for (let i = 1; i <= 5; i++) {
       const alertId = await publisher.publish({
@@ -32,7 +65,6 @@ async function runTestSimulation() {
     }
 
     console.log('\n\x1b[35m[TEST-RUNNER]\x1b[0m Publishing 1 alternative alert (OOM) with different fingerprint...');
-    // This should immediately succeed, proving isolation
     const oomAlertId = await publisher.publish({
       source: 'web-server',
       severity: 'WARNING',
@@ -42,15 +74,15 @@ async function runTestSimulation() {
     console.log(`  -> Queued [OOM] ID: ${oomAlertId}`);
 
     await publisher.close();
-    
-    console.log('\n\x1b[32m[TEST-RUNNER] Simulation payload successfully queued.\x1b[0m');
-    console.log('Verify results in your active worker console. You should observe:');
-    console.log('  1. Three database alerts succeed.');
-    console.log('  2. Two database alerts get suppressed/throttled.');
-    console.log('  3. One OOM alert succeeds (rate-limiting is isolated per fingerprint).');
-    
+
+    console.log('\n\x1b[32m[TEST-RUNNER] Simulation complete.\x1b[0m');
+    console.log('Expected results in the worker terminal:');
+    console.log('  1. Three database alerts dispatched (SMS sent).');
+    console.log('  2. Two database alerts suppressed (rate-limited).');
+    console.log('  3. One OOM alert dispatched (separate fingerprint, not rate-limited).');
+
   } catch (error: any) {
-    console.error('\x1b[31m[TEST-RUNNER ERROR]\x1b[0m Simulation run crashed:', error.message);
+    console.error('\x1b[31m[TEST-RUNNER ERROR]\x1b[0m Simulation failed:', error.message);
   } finally {
     await redis.quit();
   }

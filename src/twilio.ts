@@ -9,17 +9,23 @@ export class TwilioService {
       try {
         this.client = twilio(config.twilio.accountSid, config.twilio.authToken);
       } catch (err: any) {
-        console.error('Failed to initialize live Twilio client. Switching to mock mode.', err.message);
+        console.error(
+          '\x1b[31m[TWILIO INIT ERROR]\x1b[0m Failed to initialize Twilio client:', err.message,
+          '\n  Falling back to mock mode.'
+        );
         config.twilio.isMock = true;
       }
     }
   }
 
   /**
-   * Dispatches SMS alert notification
+   * Dispatches SMS alert notification.
+   * In mock mode, simulates a 150ms network roundtrip and returns a fake SID.
+   * In live mode, calls Twilio's messages.create API with structured error handling.
+   *
    * @param to Recipient phone number in E.164 format
    * @param body Text message body
-   * @returns Twilio Message SID string
+   * @returns Twilio Message SID string (or mock SID in simulation mode)
    */
   public async sendSms(to: string, body: string): Promise<string> {
     if (config.twilio.isMock || !this.client) {
@@ -47,13 +53,22 @@ export class TwilioService {
 
       return message.sid;
     } catch (error: any) {
-      // Robust error grouping for operational visibility
       const errorCode = error.code || 'UNKNOWN';
       const errorMessage = error.message || 'No details provided';
-      
+
+      // Provide actionable guidance for common Twilio error codes
+      let hint = '';
+      if (errorCode === 20003) {
+        hint = '\n  Hint: Authentication failed. Verify TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN in your .env file.';
+      } else if (errorCode === 21211) {
+        hint = '\n  Hint: Invalid "To" phone number. Ensure ALERT_RECIPIENT_PHONE_NUMBER is in E.164 format (+1234567890).';
+      } else if (errorCode === 21608 || errorCode === 21610) {
+        hint = '\n  Hint: The "From" number is not verified or not SMS-capable. Check TWILIO_PHONE_NUMBER in your .env file.';
+      }
+
       console.error(
         `\x1b[31m[TWILIO ERROR]\x1b[0m Failed SMS delivery to ${to}. ` +
-        `Code: ${errorCode} - Message: ${errorMessage}`
+        `Code: ${errorCode} - ${errorMessage}${hint}`
       );
 
       throw new Error(`Twilio dispatch failure: [${errorCode}] ${errorMessage}`);
